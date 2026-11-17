@@ -22,8 +22,12 @@ export async function transcribe(file: File) {
   });
   if (!r.ok) throw Error("Sarvam transcription failed");
   const data = await r.json();
+  if (typeof data.transcript !== "string" || !data.transcript.trim())
+    throw Error(
+      "Sarvam returned no transcript. Please type your list or try another recording.",
+    );
   return {
-    text: String(data.transcript),
+    text: data.transcript,
     mode: "sarvam",
     notice: "Review transcription before sending.",
   };
@@ -42,7 +46,8 @@ export function verifyMeta(
   signature: string | null,
   secret = process.env.WHATSAPP_APP_SECRET,
 ) {
-  if (!secret || !signature) return false;
+  if (!secret || !signature || !/^sha256=[a-f0-9]{64}$/.test(signature))
+    return false;
   const expected =
     "sha256=" + createHmac("sha256", secret).update(raw).digest("hex");
   return (
@@ -149,24 +154,59 @@ export class PaymentAdapter {
       );
       return { url };
     }
-    const data = await this.api("/link/create", {
-      merchantRequestId: id,
-      linkName: "NV" + id.replaceAll("-", ""),
-      linkDescription: "NammaVandi order",
-      linkType: "FIXED",
-      amount: p.amount / 100,
-      sendSms: false,
-      sendEmail: false,
-    });
-    if (!data.linkId || !data.shortUrl)
-      throw Error("Incomplete payment link response");
-    this.engine.run(
-      "UPDATE payments SET link_id=?,url=?,status='AWAITING_PAYMENT' WHERE order_id=?",
-      String(data.linkId),
-      data.shortUrl,
+    // Claim creation atomically across requests/processes before any network await.
+    const claim = this.engine.run(
+      "UPDATE payments SET status='CREATING_LINK' WHERE order_id=? AND status IN ('UNPAID','FAILED') AND url IS NULL",
       id,
     );
-    return { url: data.shortUrl };
+    if (claim.changes !== 1)
+      throw Error(
+        "A payment link is already being created. Please refresh shortly.",
+      );
+    try {
+      const data = await this.api("/link/create", {
+        merchantRequestId: id,
+        linkName: "NV" + id.replaceAll("-", ""),
+        linkDescription: "NammaVandi order",
+        linkType: "FIXED",
+        amount: p.amount / 100,
+        sendSms: false,
+        sendEmail: false,
+        partialPayment: "false",
+        bindLinkIdMobile: false,
+        maxPaymentsAllowed: "1",
+        ...(process.env.APP_URL?.startsWith("https://")
+          ? {
+              statusCallbackUrl: new URL(
+                "/api/webhooks/paytm",
+                process.env.APP_URL,
+              ).toString(),
+            }
+          : {}),
+      });
+      if (!data.linkId || !data.shortUrl)
+        throw Error("Incomplete payment link response");
+      this.engine.run(
+        "UPDATE payments SET link_id=?,url=?,status=CASE WHEN status='CREATING_LINK' THEN 'AWAITING_PAYMENT' ELSE status END WHERE order_id=?",
+        String(data.linkId),
+        data.shortUrl,
+        id,
+      );
+      if (
+        this.engine.one("SELECT status FROM orders WHERE id=?", id).status ===
+        "CANCELLED"
+      )
+        throw Error(
+          "Order was cancelled while the payment link was being created",
+        );
+      return { url: data.shortUrl };
+    } catch (error) {
+      this.engine.run(
+        "UPDATE payments SET status='UNPAID' WHERE order_id=? AND status='CREATING_LINK'",
+        id,
+      );
+      throw error;
+    }
   }
   async reconcile(id: string) {
     const p = this.engine.one("SELECT * FROM payments WHERE order_id=?", id);
@@ -185,12 +225,23 @@ export class PaymentAdapter {
         ["SUCCESS", "TXN_SUCCESS"].includes(txn.orderStatus) &&
         String(txn.mercUniqRef) === p.link_id
       ) {
+        if (typeof txn.txnId !== "string" || !txn.txnId.trim())
+          throw Error("Paytm transaction identifier missing");
         this.engine.settle(
           id,
           Math.round(Number(txn.txnAmount) * 100),
           String(txn.txnId),
           true,
           true,
+        );
+      } else if (
+        ["FAILED", "TXN_FAILURE"].includes(txn.orderStatus) &&
+        String(txn.mercUniqRef) === p.link_id
+      ) {
+        // A failed attempt never overrides a verified success or cancellation.
+        this.engine.run(
+          "UPDATE payments SET status='FAILED' WHERE order_id=? AND status IN ('UNPAID','AWAITING_PAYMENT')",
+          id,
         );
       }
     }

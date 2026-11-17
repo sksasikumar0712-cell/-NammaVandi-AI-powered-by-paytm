@@ -33,6 +33,109 @@ export class Engine {
       today(),
     );
   }
+  private resolveQuantity(id: string, productId: string, quantity: number) {
+    const message = this.one(
+      "SELECT * FROM messages WHERE json_extract(response, '$.orderId')=?",
+      id,
+    );
+    if (!message) return;
+    const response = JSON.parse(message.response);
+    response.parsed = response.parsed?.map((p: any) =>
+      p.productId === productId
+        ? { ...p, quantity, ambiguous: false, reason: undefined }
+        : p,
+    );
+    this.run(
+      "UPDATE messages SET response=? WHERE id=?",
+      JSON.stringify(response),
+      message.id,
+    );
+  }
+  revise(id: string, productId: string, quantity: number) {
+    if (
+      !Number.isSafeInteger(quantity) ||
+      quantity <= 0 ||
+      quantity > 100000000
+    )
+      throw Error("Enter a valid positive quantity");
+    return this.db.sqlite
+      .transaction(() => {
+        const o = this.one("SELECT * FROM orders WHERE id=?", id);
+        if (
+          !o ||
+          ![
+            "DRAFT",
+            "PENDING_VENDOR_APPROVAL",
+            "AWAITING_CUSTOMER_CONFIRMATION",
+          ].includes(o.status)
+        )
+          throw Error("Only an unconfirmed cart can be edited");
+        const item = this.one(
+          "SELECT * FROM order_items WHERE order_id=? AND product_id=?",
+          id,
+          productId,
+        );
+        const request = this.one(
+          "SELECT * FROM special_requests WHERE order_id=? AND product_id=? AND status IN ('PENDING_VENDOR','QUOTED')",
+          id,
+          productId,
+        );
+        if (!item && !request) throw Error("Item not found in this cart");
+        const p = this.catalog().find((p) => p.id === productId)!;
+        if (item && p.available && p.stock - p.reserved >= quantity) {
+          this.run(
+            "UPDATE order_items SET quantity=?,price=?,amount=?,inventory_id=? WHERE id=?",
+            quantity,
+            p.price,
+            lineTotal(p.price, quantity),
+            p.inventory_id,
+            item.id,
+          );
+        } else {
+          if (item) {
+            this.run("DELETE FROM order_items WHERE id=?", item.id);
+            this.run(
+              "INSERT INTO special_requests(id,order_id,product_id,quantity) VALUES (?,?,?,?)",
+              randomUUID(),
+              id,
+              productId,
+              quantity,
+            );
+          } else {
+            // A changed procurement quantity needs a fresh vendor quote.
+            this.run(
+              "UPDATE special_requests SET quantity=?,price=NULL,minimum=0,status='PENDING_VENDOR' WHERE id=?",
+              quantity,
+              request.id,
+            );
+          }
+        }
+        this.resolveQuantity(id, productId, quantity);
+        const pending = this.one(
+          "SELECT id FROM special_requests WHERE order_id=? AND status='PENDING_VENDOR'",
+          id,
+        );
+        const quoted = this.one(
+          "SELECT id FROM special_requests WHERE order_id=? AND status='QUOTED'",
+          id,
+        );
+        const total = this.one(
+          "SELECT COALESCE(SUM(amount),0) total FROM order_items WHERE order_id=?",
+          id,
+        ).total;
+        this.run(
+          "UPDATE orders SET total=?,status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+          total,
+          pending
+            ? "PENDING_VENDOR_APPROVAL"
+            : quoted
+              ? "AWAITING_CUSTOMER_CONFIRMATION"
+              : "DRAFT",
+          id,
+        );
+      })
+      .immediate();
+  }
   message(customerId: string, messageId: string, text: string) {
     return this.db.sqlite
       .transaction(() => {
@@ -54,7 +157,9 @@ export class Engine {
         if (!parsed.length) {
           result = {
             reply: /arrival|when|time|வரு|eppo/i.test(text)
-              ? `Scheduled window: ${route.arrival}. Route: ${route.status}. This is an estimate, not a live arrival promise.`
+              ? route
+                ? `Vendor schedule: ${route.days}, ${route.arrival}. Route: ${route.status}. This is an estimate, not a live arrival promise.${route.status === "CANCELLED" ? " This route is cancelled; contact your vendor for the next visit." : ""}`
+                : "No route window has been set. Please ask your vendor."
               : /stock|available|price|list/i.test(text)
                 ? catalog
                     .filter((p) => p.available && p.stock > p.reserved)
@@ -63,6 +168,10 @@ export class Engine {
                 : "Please send a shopping list with quantities, for example: ara kilo vendakkai, rendu kattu arai keerai. Unmatched items need manual clarification.",
           };
         } else {
+          if (!route || route.status === "CANCELLED")
+            throw Error(
+              "No active route is available for this street. Please ask your vendor.",
+            );
           const id = randomUUID();
           const future = /naalaiku|tomorrow|நாளை/i.test(text);
           const visitDay = future
@@ -154,6 +263,21 @@ export class Engine {
           "SELECT * FROM order_items WHERE order_id=?",
           id,
         );
+        const message = this.one(
+          "SELECT response FROM messages WHERE json_extract(response, '$.orderId')=?",
+          id,
+        );
+        const parsed = JSON.parse(message?.response || "{}").parsed || [];
+        if (
+          items.some((it) =>
+            parsed.some(
+              (p: any) => p.productId === it.product_id && p.ambiguous,
+            ),
+          )
+        )
+          throw Error(
+            "Please set each unclear quantity in the cart before confirming",
+          );
         const special = this.all(
           "SELECT * FROM special_requests WHERE order_id=? AND status='QUOTED'",
           id,
@@ -213,6 +337,15 @@ export class Engine {
     minimum: number,
     reject = false,
   ) {
+    if (
+      !Number.isSafeInteger(price) ||
+      price < 0 ||
+      !Number.isSafeInteger(quantity) ||
+      quantity <= 0 ||
+      !Number.isSafeInteger(minimum) ||
+      minimum < 0
+    )
+      throw Error("Invalid vendor quote");
     return this.db.sqlite
       .transaction(() => {
         const r = this.one("SELECT * FROM special_requests WHERE id=?", id);
@@ -226,6 +359,7 @@ export class Engine {
           reject ? "REJECTED" : "QUOTED",
           id,
         );
+        this.resolveQuantity(r.order_id, r.product_id, quantity);
         if (
           !this.one(
             "SELECT id FROM special_requests WHERE order_id=? AND status='PENDING_VENDOR'",
@@ -297,12 +431,20 @@ export class Engine {
     success: boolean,
   ) {
     if (!verified) throw Error("Unverified payment");
+    if (
+      !txn.trim() ||
+      txn === "undefined" ||
+      !Number.isSafeInteger(amount) ||
+      amount < 0
+    )
+      throw Error("Invalid payment details");
     return this.db.sqlite
       .transaction(() => {
         const p = this.one("SELECT * FROM payments WHERE order_id=?", id);
         if (!p || p.amount !== amount) throw Error("Payment amount mismatch");
         if (["PAID", "REFUND_PENDING", "REFUNDED"].includes(p.status)) return;
         const o = this.one("SELECT * FROM orders WHERE id=?", id);
+        if (!success && o.status === "CANCELLED") return;
         this.run(
           "UPDATE payments SET status=?,transaction_id=? WHERE order_id=?",
           success
@@ -338,12 +480,30 @@ export class Engine {
       ),
     }));
     const demand = this.all(
-      "SELECT s.name street,p.name,p.unit,SUM(i.quantity) quantity FROM order_items i JOIN orders o ON o.id=i.order_id JOIN customers c ON c.id=o.customer_id JOIN streets s ON s.id=c.street_id JOIN products p ON p.id=i.product_id WHERE o.status IN ('CONFIRMED','PACKED','READY') GROUP BY s.id,p.id",
+      "SELECT s.id street_id,s.name street,p.id product_id,p.name,p.unit,substr(o.visit,1,10) visit_day,SUM(i.quantity) quantity FROM order_items i JOIN orders o ON o.id=i.order_id JOIN customers c ON c.id=o.customer_id JOIN streets s ON s.id=c.street_id JOIN products p ON p.id=i.product_id WHERE o.status IN ('CONFIRMED','PACKED','READY') GROUP BY s.id,p.id,substr(o.visit,1,10)",
     );
     const procurement = this.all(
-      "SELECT s.name street,p.name,p.unit,r.status,SUM(r.quantity) quantity FROM special_requests r JOIN orders o ON o.id=r.order_id JOIN customers c ON c.id=o.customer_id JOIN streets s ON s.id=c.street_id JOIN products p ON p.id=r.product_id WHERE o.status!='CANCELLED' AND r.status NOT IN ('REJECTED','CANCELLED') GROUP BY s.id,p.id,r.status",
+      "SELECT s.id street_id,s.name street,p.id product_id,p.name,p.unit,substr(o.visit,1,10) visit_day,r.status,SUM(r.quantity) quantity FROM special_requests r JOIN orders o ON o.id=r.order_id JOIN customers c ON c.id=o.customer_id JOIN streets s ON s.id=c.street_id JOIN products p ON p.id=r.product_id WHERE o.status NOT IN ('CANCELLED','DELIVERED') AND r.status NOT IN ('REJECTED','CANCELLED') GROUP BY s.id,p.id,r.status,substr(o.visit,1,10)",
+    );
+    const purchasePlan = Array.from(
+      procurement
+        .filter((r) => r.status === "CONFIRMED")
+        .reduce((plan, r) => {
+          const key = r.product_id + ":" + r.visit_day;
+          const old = plan.get(key);
+          plan.set(key, {
+            product_id: r.product_id,
+            name: r.name,
+            unit: r.unit,
+            visit_day: r.visit_day,
+            quantity: (old?.quantity || 0) + r.quantity,
+          });
+          return plan;
+        }, new Map<string, any>())
+        .values(),
     );
     return {
+      purchasePlan,
       catalog: this.catalog(),
       orders,
       customers: this.all("SELECT * FROM customers"),
@@ -366,6 +526,7 @@ export class Engine {
       ),
       pendingRequests: data.procurement.filter((r) => r.status !== "CONFIRMED"),
       reservedDemand: data.demand,
+      purchasePlan: data.purchasePlan,
     });
     this.db.orm
       .insert(schema.vendorPurchaseSummaries)

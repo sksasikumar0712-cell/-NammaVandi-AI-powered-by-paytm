@@ -1498,3 +1498,52 @@ label.check {
     min-height: 44px;
   }
 }
+
+.quantity-editor {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 0 0 14px;
+  flex-wrap: wrap;
+}
+.quantity-editor label {
+  flex: 1;
+  min-width: 100px;
+}
+.quantity-editor input {
+  max-width: 180px;
+}
+.quantity-editor button {
+  font-size: 12px;
+}
+.cart-line + .cart-line {
+  border-top: 1px solid var(--border);
+}
+.purchase-plan {
+  margin-bottom: 24px;
+}
+/* Keep operational labels readable and controls usable on a vendor's phone. */
+nav a {
+  font-size: 13px;
+}
+table {
+  font-size: 14px;
+}
+th {
+  font-size: 12px;
+}
+.badge {
+  font-size: 11px;
+}
+.stat > div {
+  font-size: 13px;
+}
+.stat small,
+.route-row small,
+.request-row small,
+td small {
+  font-size: 12px;
+}
+.quantity-editor label {
+  font-size: 12px;
+}

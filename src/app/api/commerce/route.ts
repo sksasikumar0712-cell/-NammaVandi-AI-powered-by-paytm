@@ -21,6 +21,7 @@ const action = z.discriminatedUnion("action", [
     id,
     handoff: z.string().min(1).max(200),
   }),
+  z.object({ action: z.literal("revise"), id, productId: id, quantity: qty }),
   z.object({
     action: z.literal("status"),
     id,
@@ -90,6 +91,9 @@ export async function POST(req: Request) {
         break;
       case "confirm":
         result = e.confirm(a.id, a.handoff);
+        break;
+      case "revise":
+        e.revise(a.id, a.productId, a.quantity);
         break;
       case "status":
         e.change(a.id, a.status);

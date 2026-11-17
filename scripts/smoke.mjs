@@ -19,6 +19,7 @@ const server = spawn(
       ...process.env,
       DATABASE_PATH: join(temp, "smoke.db"),
       PAYMENT_MODE: "mock",
+      SARVAM_API_KEY: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   },
@@ -114,8 +115,64 @@ try {
     body: JSON.stringify(message),
   });
   assert.equal(crossOrigin.status, 400);
+  const unclear = await post({
+    ...message,
+    messageId: "http-unclear",
+    text: "vendakkai",
+  });
+  const denied = await fetch(base + "/api/commerce", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "confirm",
+      id: unclear.orderId,
+      handoff: "Door",
+    }),
+  });
+  assert.equal(denied.status, 400);
+  await post({
+    action: "revise",
+    id: unclear.orderId,
+    productId: "p2",
+    quantity: 250,
+  });
+  await post({
+    action: "confirm",
+    id: unclear.orderId,
+    handoff: "Leave with security",
+  });
+  snapshot = await (await fetch(base + "/api/commerce")).json();
+  assert.equal(
+    snapshot.orders.find((o) => o.id === unclear.orderId).total,
+    1250,
+  );
+  await post({ action: "prices", text: "Tomato,30,42" });
+  const badImport = await fetch(base + "/api/commerce", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "prices",
+      text: "Tomato,30,50\nUnknown product,10,20",
+    }),
+  });
+  assert.equal(badImport.status, 400);
+  snapshot = await (await fetch(base + "/api/commerce")).json();
+  assert.equal(snapshot.catalog.find((p) => p.id === "p0").price, 4200);
+  const form = new FormData();
+  form.set(
+    "file",
+    new File(["sample"], "handwritten.png", { type: "image/png" }),
+  );
+  const media = await fetch(base + "/api/media", {
+    method: "POST",
+    body: form,
+  });
+  assert.equal(media.status, 200);
+  const extracted = await media.json();
+  assert.equal(extracted.mode, "mock");
+  assert.match(extracted.notice, /not analysed/);
   console.log(
-    "PASS: five pages HTTP 200; real HTTP cart → confirmation → mock failure/success → delivery; special quote → confirmation → procurement; duplicate dedup; forged callbacks and cross-origin mutation rejected.",
+    "PASS: five pages HTTP 200; HTTP cart → confirmation → mock failure/success → delivery; special quote → confirmation → procurement; unclear quantity blocked → corrected → reserved; price-import rollback; labelled mock image upload; duplicate dedup; forged callbacks and cross-origin mutation rejected.",
   );
 } catch (error) {
   console.error(logs);

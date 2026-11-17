@@ -202,3 +202,113 @@ describe("Commerce engine integration", () => {
     expect(e.snapshot().catalog).toHaveLength(15);
   });
 });
+
+describe("Cart correction and lifecycle safeguards", () => {
+  it("requires an unclear quantity to be corrected before reservation", () => {
+    const id = order("vendakkai");
+    expect(() => e.confirm(id, "Door")).toThrow("unclear quantity");
+    e.revise(id, "p2", 500);
+    e.confirm(id, "Door");
+    expect(e.one("SELECT total FROM orders WHERE id=?", id).total).toBe(2500);
+    expect(
+      e.one("SELECT reserved FROM daily_inventory WHERE id='i2'").reserved,
+    ).toBe(500);
+    expect(() => e.revise(id, "p2", 1000)).toThrow("unconfirmed");
+  });
+  it("recalculates vendor prices and turns excess quantities into market requests", () => {
+    const id = order("1 kg tomato");
+    e.revise(id, "p0", 250);
+    expect(e.one("SELECT total FROM orders WHERE id=?", id).total).toBe(1000);
+    e.revise(id, "p0", 25000);
+    expect(e.one("SELECT status FROM orders WHERE id=?", id).status).toBe(
+      "PENDING_VENDOR_APPROVAL",
+    );
+    expect(
+      e.one("SELECT quantity FROM special_requests WHERE order_id=?", id)
+        .quantity,
+    ).toBe(25000);
+    expect(
+      e.one("SELECT COUNT(*) n FROM order_items WHERE order_id=?", id).n,
+    ).toBe(0);
+    expect(() => e.confirm(id, "Door")).toThrow("Vendor");
+  });
+  it("invalidates a vendor quote when the customer changes the requested quantity", () => {
+    const id = order("1 kg drumstick");
+    const r = e.one("SELECT * FROM special_requests WHERE order_id=?", id);
+    e.quote(r.id, 8000, 1000, 0);
+    e.revise(id, "p4", 2000);
+    expect(
+      e.one("SELECT * FROM special_requests WHERE id=?", r.id),
+    ).toMatchObject({ status: "PENDING_VENDOR", quantity: 2000, price: null });
+    expect(() => e.confirm(id, "Door")).toThrow("Vendor");
+    expect(e.summary().confirmedProcurement).toHaveLength(0);
+  });
+  it("rejects editing or quoting a cancelled order", () => {
+    const id = order("1 kg drumstick");
+    const r = e.one("SELECT * FROM special_requests WHERE order_id=?", id);
+    e.change(id, "CANCELLED");
+    expect(() => e.quote(r.id, 8000, 1000, 0)).toThrow();
+    expect(() => e.revise(id, "p4", 2000)).toThrow();
+  });
+  it("reports route cancellation and never invents an arrival", () => {
+    e.run("UPDATE routes SET status='CANCELLED' WHERE id='r0'");
+    expect(e.message("c0", "arrival", "When will you arrive?").reply).toContain(
+      "cancelled",
+    );
+    expect(() => order()).toThrow("No active route");
+  });
+  it("handles late verified success after cancellation as refund pending", () => {
+    const id = order();
+    e.confirm(id, "Door");
+    e.change(id, "CANCELLED");
+    e.settle(id, 4000, "late-txn", true, true);
+    expect(
+      e.one("SELECT status FROM payments WHERE order_id=?", id).status,
+    ).toBe("REFUND_PENDING");
+    expect(e.one("SELECT status FROM orders WHERE id=?", id).status).toBe(
+      "CANCELLED",
+    );
+    expect(
+      e.one("SELECT reserved FROM daily_inventory WHERE id='i0'").reserved,
+    ).toBe(0);
+  });
+  it("does not reuse one verified transaction for two orders", () => {
+    const a = order(),
+      b = order("1 kg tomato", "c1");
+    e.confirm(a, "Door");
+    e.confirm(b, "Door");
+    e.settle(a, 4000, "one-transaction", true, true);
+    expect(() => e.settle(b, 4000, "one-transaction", true, true)).toThrow();
+    expect(
+      e.one("SELECT status FROM payments WHERE order_id=?", b).status,
+    ).toBe("UNPAID");
+  });
+});
+
+describe("Purchase planning", () => {
+  it("keeps visits on different days separate and excludes fulfilled procurement", () => {
+    const a = order("1 kg drumstick"),
+      b = order("naalaiku murungakkai 2 kg venum", "c3");
+    for (const id of [a, b]) {
+      const r = e.one("SELECT * FROM special_requests WHERE order_id=?", id);
+      e.quote(r.id, 8000, r.quantity, 0);
+      e.confirm(id, "Door");
+    }
+    expect(e.snapshot().purchasePlan).toHaveLength(2);
+    expect(e.snapshot().procurement[0].visit_day).not.toBe(
+      e.snapshot().procurement[1].visit_day,
+    );
+    for (const state of ["PACKED", "READY", "DELIVERED"]) e.change(a, state);
+    expect(e.summary().purchasePlan).toHaveLength(1);
+    expect(e.summary().purchasePlan[0].quantity).toBe(2000);
+  });
+  it("joins demand to stable street IDs even after a route is renamed", () => {
+    const id = order();
+    e.confirm(id, "Door");
+    e.run("UPDATE routes SET name='Morning round' WHERE id='r0'");
+    expect(e.snapshot().demand[0]).toMatchObject({
+      street_id: "s0",
+      street: "R.N. Apartment",
+    });
+  });
+});

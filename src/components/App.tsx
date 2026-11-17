@@ -1,6 +1,7 @@
 "use client";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useTransition } from "react";
 import Link from "next/link";
+import { savePurchaseSummary } from "@/app/actions";
 import {
   LayoutDashboard,
   ShoppingBasket,
@@ -72,6 +73,7 @@ export default function App({ page }: { page: string }) {
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false);
+  const [summaryPending, startSummary] = useTransition();
   const refresh = async () => {
     const r = await fetch("/api/commerce");
     const d = await r.json();
@@ -102,7 +104,12 @@ export default function App({ page }: { page: string }) {
     }
   }
   async function summary() {
-    const r = await act({ action: "summary" });
+    const result = await savePurchaseSummary();
+    if (result.error) {
+      setError(result.error);
+      return;
+    }
+    const r = result.data;
     if (r) {
       const blob = new Blob([JSON.stringify(r, null, 2)], {
         type: "application/json",
@@ -160,7 +167,13 @@ export default function App({ page }: { page: string }) {
         </div>
         <div className="local">
           <span />
-          Local-first demo<small>Fictional data · No real payments</small>
+          Local-first demo
+          <small>
+            Fictional data ·{" "}
+            {data?.paymentMode === "staging"
+              ? "Paytm staging"
+              : "No real payments"}
+          </small>
         </div>
       </aside>
       <div className="main">
@@ -170,7 +183,9 @@ export default function App({ page }: { page: string }) {
             {nav.find((n) => n[0] === page)?.[1]}
           </span>
           <div>
-            <Badge tone="neutral">Demo mode</Badge>
+            <Badge tone="neutral">
+              {data?.paymentMode === "staging" ? "Paytm staging" : "Demo mode"}
+            </Badge>
             <span className="date">
               {new Date().toLocaleDateString("en-IN", {
                 day: "numeric",
@@ -196,7 +211,10 @@ export default function App({ page }: { page: string }) {
               <p>{descriptions[page]}</p>
             </div>
             {page === "dashboard" && (
-              <button onClick={summary} disabled={busy}>
+              <button
+                onClick={() => startSummary(summary)}
+                disabled={busy || summaryPending}
+              >
                 <Download size={17} />
                 Purchase summary
               </button>
@@ -264,9 +282,7 @@ function Dashboard({ d }: { d: any }) {
   const active = d.orders.filter(
     (o: any) =>
       ["CONFIRMED", "PACKED", "READY", "DELIVERED"].includes(o.status) &&
-      new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(
-        new Date(o.created_at.replace(" ", "T") + "Z"),
-      ) === d.today,
+      o.visit.startsWith(d.today),
   );
   const stats = [
     [
@@ -392,7 +408,9 @@ function Dashboard({ d }: { d: any }) {
               <div className="request-row" key={i}>
                 <div>
                   <strong>{r.name}</strong>
-                  <small>{r.street}</small>
+                  <small>
+                    {r.street} · {r.visit_day}
+                  </small>
                 </div>
                 <div>
                   <strong>{quantity(r.quantity, r.unit)}</strong>
@@ -412,6 +430,31 @@ function Dashboard({ d }: { d: any }) {
           </Link>
         </section>
       </div>
+      <section className="card purchase-plan">
+        <div className="section-title">
+          <div>
+            <h2>Your market purchase list</h2>
+            <p>Buy these only after both you and the customer have confirmed</p>
+          </div>
+          <ShoppingBasket size={22} />
+        </div>
+        {d.purchasePlan.length ? (
+          d.purchasePlan.map((r: any) => (
+            <div className="request-row" key={r.product_id + r.visit_day}>
+              <div>
+                <strong>{r.name}</strong>
+                <small>For the {r.visit_day} round</small>
+              </div>
+              <strong>{quantity(r.quantity, r.unit)}</strong>
+            </div>
+          ))
+        ) : (
+          <p className="empty">
+            No confirmed market purchases yet. Pending requests still need a
+            quote and customer confirmation.
+          </p>
+        )}
+      </section>
       <div className="columns">
         <section className="card">
           <div className="section-title">
@@ -431,7 +474,10 @@ function Dashboard({ d }: { d: any }) {
             <tbody>
               {d.demand.map((r: any, i: number) => (
                 <tr key={i}>
-                  <td>{r.street}</td>
+                  <td>
+                    {r.street}
+                    <small>{r.visit_day}</small>
+                  </td>
                   <td>{r.name}</td>
                   <td>
                     <b>{quantity(r.quantity, r.unit)}</b>
@@ -741,6 +787,45 @@ function OrderCard({
       setCheckout(true);
   }, [mode, o.id, o.payment_status]);
   const draft = ["DRAFT", "AWAITING_CUSTOMER_CONFIRMATION"].includes(o.status);
+  const editable = [
+    "DRAFT",
+    "PENDING_VENDOR_APPROVAL",
+    "AWAITING_CUSTOMER_CONFIRMATION",
+  ].includes(o.status);
+  const quantityEditor = (item: any) =>
+    editable && (
+      <form
+        className="quantity-editor"
+        key={item.quantity}
+        onSubmit={async (ev) => {
+          ev.preventDefault();
+          const f = new FormData(ev.currentTarget);
+          await act({
+            action: "revise",
+            id: o.id,
+            productId: item.product_id,
+            quantity: Math.round(Number(f.get("quantity")) * 1000),
+          });
+        }}
+      >
+        <label>
+          Set quantity ({item.unit})
+          <input
+            aria-label={`${item.name} quantity in ${item.unit}`}
+            name="quantity"
+            type="number"
+            min="0.001"
+            max="100000"
+            step="0.001"
+            defaultValue={item.quantity / 1000}
+            required
+          />
+        </label>
+        <button className="secondary" type="submit">
+          Apply quantity
+        </button>
+      </form>
+    );
   return (
     <article className="card order-card">
       <div className="order-head">
@@ -755,26 +840,30 @@ function OrderCard({
         </Badge>
       </div>
       {o.items.map((i: any) => (
-        <div className="line-item" key={i.id}>
-          <span>
-            {i.name}
-            {o.parsed?.some(
-              (p: any) => p.productId === i.product_id && p.ambiguous,
-            ) &&
-              [
-                "DRAFT",
-                "PENDING_VENDOR_APPROVAL",
-                "AWAITING_CUSTOMER_CONFIRMATION",
-              ].includes(o.status) && (
-                <small className="danger">
-                  Quantity unclear: review this suggested quantity.
-                </small>
-              )}
-            <small>
-              {quantity(i.quantity, i.unit)} × {money(i.price)}/{i.unit}
-            </small>
-          </span>
-          <strong>{money(i.amount)}</strong>
+        <div className="cart-line" key={i.id}>
+          <div className="line-item">
+            <span>
+              {i.name}
+              {o.parsed?.some(
+                (p: any) => p.productId === i.product_id && p.ambiguous,
+              ) &&
+                [
+                  "DRAFT",
+                  "PENDING_VENDOR_APPROVAL",
+                  "AWAITING_CUSTOMER_CONFIRMATION",
+                ].includes(o.status) && (
+                  <small className="danger">
+                    {o.parsed.find((p: any) => p.productId === i.product_id)
+                      ?.reason || "Quantity unclear: please set it below."}
+                  </small>
+                )}
+              <small>
+                {quantity(i.quantity, i.unit)} × {money(i.price)}/{i.unit}
+              </small>
+            </span>
+            <strong>{money(i.amount)}</strong>
+          </div>
+          {quantityEditor(i)}
         </div>
       ))}
       {o.specials.map((r: any) => (
@@ -785,13 +874,16 @@ function OrderCard({
             </strong>
             <Badge tone="amber">{label(r.status)}</Badge>
           </div>
-          {r.status === "QUOTED" && (
+          {["QUOTED", "CONFIRMED"].includes(r.status) && (
             <p>
               Vendor quote: {money(r.price)}/{r.unit}. Total:{" "}
               {money(Math.round((r.price * r.quantity) / 1000))}. Minimum:{" "}
               {quantity(r.minimum, r.unit)}.
             </p>
           )}
+          {customer &&
+            ["PENDING_VENDOR", "QUOTED"].includes(r.status) &&
+            quantityEditor(r)}
           {!customer && ["PENDING_VENDOR", "QUOTED"].includes(r.status) && (
             <form
               onSubmit={async (ev) => {
@@ -900,8 +992,9 @@ function OrderCard({
             </select>
           </label>
           <p className="fine">
-            Confirm every quantity above. To correct an item, cancel this draft
-            and send a revised list. Prepayment is optional.
+            Confirm every quantity above. Apply any quantity changes before
+            reserving. Changes to a market request need a fresh vendor quote.
+            Prepayment is optional.
           </p>
           <button onClick={() => act({ action: "confirm", id: o.id, handoff })}>
             <Check size={16} />
@@ -910,7 +1003,7 @@ function OrderCard({
         </>
       )}
       <div className="actions">
-        {["CONFIRMED", "PACKED", "READY"].includes(o.status) &&
+        {["CONFIRMED", "PACKED", "READY", "DELIVERED"].includes(o.status) &&
           !["PAID", "REFUND_PENDING", "REFUNDED"].includes(
             o.payment_status,
           ) && (
@@ -979,31 +1072,35 @@ function OrderCard({
           </button>
         )}
       </div>
-      {checkout && (
-        <div className="checkout">
-          <Badge tone="blue">MOCK PAYTM · NO MONEY MOVES</Badge>
-          <h3>{money(o.total)}</h3>
-          <p>This checkout tests the server payment adapter.</p>
-          <button
-            className="payment-button"
-            onClick={async () => {
-              if (await act({ action: "mockPay", id: o.id, success: true }))
-                setCheckout(false);
-            }}
-          >
-            Simulate success
-          </button>
-          <button
-            className="secondary"
-            onClick={async () => {
-              if (await act({ action: "mockPay", id: o.id, success: false }))
-                setCheckout(false);
-            }}
-          >
-            Simulate failure
-          </button>
-        </div>
-      )}
+      {checkout &&
+        !["PAID", "CANCELLED", "REFUND_PENDING", "REFUNDED"].includes(
+          o.payment_status,
+        ) &&
+        o.status !== "CANCELLED" && (
+          <div className="checkout">
+            <Badge tone="blue">MOCK PAYTM · NO MONEY MOVES</Badge>
+            <h3>{money(o.total)}</h3>
+            <p>This checkout tests the server payment adapter.</p>
+            <button
+              className="payment-button"
+              onClick={async () => {
+                if (await act({ action: "mockPay", id: o.id, success: true }))
+                  setCheckout(false);
+              }}
+            >
+              Simulate success
+            </button>
+            <button
+              className="secondary"
+              onClick={async () => {
+                if (await act({ action: "mockPay", id: o.id, success: false }))
+                  setCheckout(false);
+              }}
+            >
+              Simulate failure
+            </button>
+          </div>
+        )}
     </article>
   );
 }
@@ -1088,7 +1185,10 @@ function Routes({
               </div>
               <div>
                 <strong>
-                  {d.demand.filter((x: any) => x.street === r.name).length}
+                  {
+                    d.demand.filter((x: any) => x.street_id === r.street_id)
+                      .length
+                  }
                 </strong>
                 <small>Products reserved</small>
               </div>

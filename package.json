@@ -8,8 +8,8 @@
     "start": "next start --hostname 127.0.0.1",
     "lint": "eslint .",
     "test": "vitest run",
-    "db:migrate": "node --import tsx scripts/migrate.ts",
-    "db:seed": "node --import tsx scripts/seed.ts",
+    "db:migrate": "node --env-file-if-exists=.env --import tsx scripts/migrate.ts",
+    "db:seed": "node --env-file-if-exists=.env --import tsx scripts/seed.ts",
     "test:smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
@@ -35,5 +35,8 @@
     "tsx": "^4.20.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }

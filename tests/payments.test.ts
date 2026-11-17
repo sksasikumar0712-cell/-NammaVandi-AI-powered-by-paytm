@@ -125,3 +125,90 @@ it("disables mock success in staging and verifies callback checksums", async () 
     await verifyPaytmCallback({ ...body, STATUS: "TXN_FAILURE", CHECKSUMHASH }),
   ).toBe(false);
 });
+
+it("allows only one in-flight staging payment-link creation", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const fetcher = vi.fn(async () => {
+    await gate;
+    return signed({
+      resultInfo: { resultStatus: "SUCCESS" },
+      linkId: 123,
+      shortUrl: "https://example.test/link",
+    });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  const first = new PaymentAdapter(e).create(id);
+  await expect(new PaymentAdapter(e).create(id)).rejects.toThrow(
+    "already being created",
+  );
+  release();
+  await first;
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect((await new PaymentAdapter(e).create(id)).url).toBe(
+    "https://example.test/link",
+  );
+  expect(fetcher).toHaveBeenCalledTimes(1);
+});
+it("preserves a cancellation while a staging link request is in flight", async () => {
+  vi.stubGlobal("fetch", async () => {
+    e.change(id, "CANCELLED");
+    return signed({
+      resultInfo: { resultStatus: "SUCCESS" },
+      linkId: 123,
+      shortUrl: "https://example.test/link",
+    });
+  });
+  await expect(new PaymentAdapter(e).create(id)).rejects.toThrow("cancelled");
+  expect(e.one("SELECT * FROM payments WHERE order_id=?", id)).toMatchObject({
+    status: "CANCELLED",
+    link_id: "123",
+  });
+});
+it("rejects signed success with a missing transaction ID", async () => {
+  e.run("UPDATE payments SET link_id='123' WHERE order_id=?", id);
+  vi.stubGlobal("fetch", () =>
+    signed({
+      resultInfo: { resultStatus: "SUCCESS" },
+      orders: [{ mercUniqRef: "123", txnAmount: 40, orderStatus: "SUCCESS" }],
+    }),
+  );
+  await expect(new PaymentAdapter(e).reconcile(id)).rejects.toThrow(
+    "identifier missing",
+  );
+  expect(e.one("SELECT status FROM payments WHERE order_id=?", id).status).toBe(
+    "UNPAID",
+  );
+});
+it("shows a verified failed transaction without letting later failures overwrite success", async () => {
+  e.run(
+    "UPDATE payments SET link_id='123', status='AWAITING_PAYMENT' WHERE order_id=?",
+    id,
+  );
+  const respond = (status: string) =>
+    signed({
+      resultInfo: { resultStatus: "SUCCESS" },
+      orders: [
+        {
+          mercUniqRef: "123",
+          txnId: "verified-txn",
+          txnAmount: 40,
+          orderStatus: status,
+        },
+      ],
+    });
+  vi.stubGlobal("fetch", () => respond("TXN_FAILURE"));
+  await new PaymentAdapter(e).reconcile(id);
+  expect(e.one("SELECT status FROM payments WHERE order_id=?", id).status).toBe(
+    "FAILED",
+  );
+  vi.stubGlobal("fetch", () => respond("TXN_SUCCESS"));
+  await new PaymentAdapter(e).reconcile(id);
+  vi.stubGlobal("fetch", () => respond("TXN_FAILURE"));
+  await new PaymentAdapter(e).reconcile(id);
+  expect(e.one("SELECT status FROM payments WHERE order_id=?", id).status).toBe(
+    "PAID",
+  );
+});
